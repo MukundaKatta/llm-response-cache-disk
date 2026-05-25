@@ -1,81 +1,69 @@
-# token-budget-py
+# llm-response-cache-disk
 
-[![PyPI](https://img.shields.io/pypi/v/token-budget-py.svg)](https://pypi.org/project/token-budget-py/)
-[![Python](https://img.shields.io/pypi/pyversions/token-budget-py.svg)](https://pypi.org/project/token-budget-py/)
+[![PyPI](https://img.shields.io/pypi/v/llm-response-cache-disk.svg)](https://pypi.org/project/llm-response-cache-disk/)
+[![Python](https://img.shields.io/pypi/pyversions/llm-response-cache-disk.svg)](https://pypi.org/project/llm-response-cache-disk/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-**Thread-safe shared token + USD budget for concurrent LLM tasks.**
+**SQLite-backed disk cache for LLM text responses.**
 
-Fan-out workloads — agents, parallel summarizers, batch evals — race many
-tasks to consume from one shared budget. This library is a small,
-zero-dependency counter with two axes (tokens, USD) that returns
-`BudgetExceeded` when a record would push past a configured cap.
+Complements in-process LRU caches by persisting responses across process
+restarts. Useful during development to avoid repeated API calls while
+iterating on prompts, agents, or pipelines.
 
-Sibling to the Rust crate
-[`token-budget-pool`](https://crates.io/crates/token-budget-pool).
+Zero runtime dependencies (uses stdlib `sqlite3`). Thread-safe. Python 3.10+.
 
 ## Install
 
 ```bash
-pip install token-budget-py
+pip install llm-response-cache-disk
 ```
 
-## Use
+## Quick start
 
 ```python
-from token_budget import BudgetPool, BudgetExceeded
+from llm_response_cache_disk import DiskResponseCache
 
-pool = BudgetPool(token_cap=1_000_000, usd_cap=10.0)
+cache = DiskResponseCache("~/.cache/llm/responses.db", ttl_seconds=86_400)
 
-try:
-    pool.record(tokens=1200, usd=0.0036)
-except BudgetExceeded as e:
-    # tell this worker to skip
-    print(f"out of budget: {e}")
+# Basic get/set
+cache.set("my-key", "some LLM response")
+value = cache.get("my-key")   # returns None on miss or expiry
+
+# Decorator — wraps any sync str-returning function
+@cache.cached()
+def call_api(prompt: str) -> str:
+    return my_llm_client.complete(prompt)
+
+response = call_api("Tell me about caching")  # first call hits the API
+response = call_api("Tell me about caching")  # second call returns from disk
+
+# Custom cache key
+import hashlib
+
+@cache.cached(key_fn=lambda prompt: hashlib.sha256(prompt.encode()).hexdigest())
+def call_with_custom_key(prompt: str) -> str:
+    return my_llm_client.complete(prompt)
 ```
 
-Two-phase commit (reserve before the LLM call, commit the actual usage):
+## API
 
-```python
-with pool.reserve(tokens=2000, usd=0.012) as r:
-    result = call_llm(prompt)
-    r.commit(tokens=result.usage.total_tokens, usd=result.cost_usd)
-```
+### `DiskResponseCache(path, max_entries=10_000, ttl_seconds=86_400)`
 
-If the `with` block exits without `r.commit()` (e.g. the LLM call raised),
-the reservation is auto-released — no orphaned slots.
+- `path` — path to the SQLite file; `~` is expanded, parent directories are created automatically.
+- `max_entries` — maximum entries to keep; oldest (by expiry) are evicted when exceeded.
+- `ttl_seconds` — default time-to-live per entry.
 
-Either axis is optional:
-
-```python
-only_tokens = BudgetPool(token_cap=500_000)        # USD unbounded
-only_usd    = BudgetPool(usd_cap=5.0)              # tokens unbounded
-unbounded   = BudgetPool()                         # both unbounded (counter only)
-```
-
-Atomic read of current state:
-
-```python
-snap = pool.snapshot()
-snap.tokens_used         # 1200
-snap.usd_remaining       # 9.9964
-snap.tokens_remaining    # 998800 (cap - used - reserved)
-```
-
-## What it does NOT do
-
-- No async runtime lock-in. Works under `asyncio`, `trio`, threads, sync.
-  The internal lock is a plain `threading.Lock` (held only for the
-  microseconds of a counter update).
-- No HTTP. Doesn't talk to any LLM provider.
-- No cost calculation. Wrap a cost calculator that returns USD per call
-  and feed the result into `record`. (See `claude-cost`, `openai-cost`,
-  `gemini-cost`, `bedrock-cost` on crates.io for Rust cost calculators
-  with the same authorship.)
-- No persistence. Counts live in process. For multi-process / multi-host
-  budgets, wrap a Redis or DB increment instead.
-- No automatic rollover. Call `pool.reset()` from your own cron / time
-  loop if you want a periodic window.
+| Method | Description |
+|---|---|
+| `get(key)` | Return cached value or `None` on miss/expiry. Expired entries are deleted on access. |
+| `set(key, value, ttl_seconds=None)` | Store value. `ttl_seconds` overrides the instance default for this entry. |
+| `delete(key)` | Remove entry. Returns `True` if it existed. |
+| `clear()` | Remove all entries. |
+| `size()` | Total entries in DB (including expired). |
+| `stats()` | Returns `CacheStats(hits, misses, expired, total_entries)`. |
+| `invalidate_expired()` | Delete all expired entries. Returns count removed. |
+| `cached(key_fn=None)` | Decorator for sync str-returning functions. |
+| `key in cache` | `True` if key exists and has not expired. |
 
 ## License
 
