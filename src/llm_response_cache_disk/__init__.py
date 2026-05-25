@@ -1,242 +1,147 @@
+"""
+llm-response-cache-disk: SQLite-backed disk cache for LLM responses.
+"""
+from __future__ import annotations
+
 import hashlib
 import json
 import os
 import sqlite3
-import threading
 import time
-from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any, Optional
 
-__all__ = ["DiskResponseCache", "CacheStats"]
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS cache (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL,
-    expires_at REAL NOT NULL,
-    created_at REAL NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_expires ON cache(expires_at);
-"""
+def _hash_request(messages: list[dict[str, Any]], model: str = "", **extras: Any) -> str:
+    payload = {"messages": messages, "model": model, **extras}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
 @dataclass
-class CacheStats:
-    hits: int
-    misses: int
-    expired: int
-    total_entries: int
+class CacheEntry:
+    key: str
+    response: Any
+    created_at: float
+    ttl: Optional[float]
+    hit_count: int = 0
+    model: str = ""
+
+    @property
+    def expired(self) -> bool:
+        if self.ttl is None:
+            return False
+        return (time.time() - self.created_at) >= self.ttl
 
 
 class DiskResponseCache:
-    """SQLite-backed disk cache for LLM text responses.
+    """
+    SQLite-backed disk cache for LLM responses. Persists across restarts.
 
-    Responses persist across process restarts. Thread-safe via RLock.
-    Zero runtime dependencies — uses stdlib sqlite3 only.
+    Usage::
 
-    Args:
-        path: Path to the SQLite database file. ``~`` is expanded.
-        max_entries: Maximum number of entries to keep. Oldest entries
-            (by expires_at) are evicted when the limit is exceeded.
-        ttl_seconds: Default time-to-live in seconds for each entry.
+        cache = DiskResponseCache("/tmp/llm-cache.db", default_ttl=3600)
+        key = cache.put(messages, response, model="claude")
+        cached = cache.get(messages, model="claude")
     """
 
-    def __init__(
+    def __init__(self, db_path: str, default_ttl: Optional[float] = None) -> None:
+        self._db_path = db_path
+        self._default_ttl = default_ttl
+        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+        self._init_db()
+
+    def _conn(self) -> sqlite3.Connection:
+        return sqlite3.connect(self._db_path)
+
+    def _init_db(self) -> None:
+        with self._conn() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS cache (
+                    key TEXT PRIMARY KEY,
+                    response TEXT NOT NULL,
+                    model TEXT DEFAULT '',
+                    created_at REAL NOT NULL,
+                    ttl REAL,
+                    hit_count INTEGER DEFAULT 0
+                )
+            """)
+            conn.commit()
+
+    def put(
         self,
-        path: str,
-        max_entries: int = 10_000,
-        ttl_seconds: int = 86_400,
-    ) -> None:
-        self._path = os.path.expanduser(path)
-        self._max_entries = max_entries
-        self._ttl_seconds = ttl_seconds
-        self._lock = threading.RLock()
+        messages: list[dict[str, Any]],
+        response: Any,
+        model: str = "",
+        ttl: Optional[float] = None,
+        **extras: Any,
+    ) -> str:
+        key = _hash_request(messages, model=model, **extras)
+        effective_ttl = ttl if ttl is not None else self._default_ttl
+        with self._conn() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO cache (key, response, model, created_at, ttl, hit_count)
+                VALUES (?, ?, ?, ?, ?, 0)
+            """, (key, json.dumps(response), model, time.time(), effective_ttl))
+            conn.commit()
+        return key
 
-        # In-memory counters; reset when a new instance is created.
-        self._hits = 0
-        self._misses = 0
-        self._expired = 0
-
-        # Auto-create parent directories.
-        parent = os.path.dirname(self._path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-
-        self._conn = sqlite3.connect(self._path, check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.executescript(_SCHEMA)
-        self._conn.commit()
-
-    # ------------------------------------------------------------------
-    # Core get / set / delete
-    # ------------------------------------------------------------------
-
-    def get(self, key: str) -> str | None:
-        """Return cached value, or None on miss or expiry.
-
-        Expired entries are deleted immediately and counted in stats.
-        """
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT value, expires_at FROM cache WHERE key = ?", (key,)
+    def get(self, messages: list[dict[str, Any]], model: str = "", **extras: Any) -> Optional[Any]:
+        key = _hash_request(messages, model=model, **extras)
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT response, created_at, ttl FROM cache WHERE key = ?", (key,)
             ).fetchone()
-
             if row is None:
-                self._misses += 1
                 return None
-
-            value, expires_at = row
-            if time.time() > expires_at:
-                # Delete the stale entry and report as expired.
-                self._conn.execute("DELETE FROM cache WHERE key = ?", (key,))
-                self._conn.commit()
-                self._expired += 1
-                self._misses += 1
+            response_json, created_at, ttl = row
+            if ttl is not None and (time.time() - created_at) >= ttl:
+                conn.execute("DELETE FROM cache WHERE key = ?", (key,))
+                conn.commit()
                 return None
+            conn.execute("UPDATE cache SET hit_count = hit_count + 1 WHERE key = ?", (key,))
+            conn.commit()
+        return json.loads(response_json)
 
-            self._hits += 1
-            return value
+    def has(self, messages: list[dict[str, Any]], model: str = "", **extras: Any) -> bool:
+        return self.get(messages, model=model, **extras) is not None
 
-    def set(
-        self,
-        key: str,
-        value: str,
-        ttl_seconds: int | None = None,
-    ) -> None:
-        """Store *value* under *key* with an optional per-entry TTL override."""
-        ttl = ttl_seconds if ttl_seconds is not None else self._ttl_seconds
-        now = time.time()
-        expires_at = now + ttl
+    def delete(self, messages: list[dict[str, Any]], model: str = "", **extras: Any) -> bool:
+        key = _hash_request(messages, model=model, **extras)
+        with self._conn() as conn:
+            cur = conn.execute("DELETE FROM cache WHERE key = ?", (key,))
+            conn.commit()
+            return cur.rowcount > 0
 
-        with self._lock:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO cache (key, value, expires_at, created_at)"
-                " VALUES (?, ?, ?, ?)",
-                (key, value, expires_at, now),
+    def prune_expired(self) -> int:
+        with self._conn() as conn:
+            cur = conn.execute(
+                "DELETE FROM cache WHERE ttl IS NOT NULL AND (? - created_at) >= ttl",
+                (time.time(),)
             )
-            self._conn.commit()
-            self._evict_if_needed()
+            conn.commit()
+            return cur.rowcount
 
-    def delete(self, key: str) -> bool:
-        """Remove *key* from the cache. Returns True if the key existed."""
-        with self._lock:
-            cursor = self._conn.execute("DELETE FROM cache WHERE key = ?", (key,))
-            self._conn.commit()
-            return cursor.rowcount > 0
+    def clear(self) -> int:
+        with self._conn() as conn:
+            cur = conn.execute("DELETE FROM cache")
+            conn.commit()
+            return cur.rowcount
 
-    def clear(self) -> None:
-        """Remove all entries from the cache."""
-        with self._lock:
-            self._conn.execute("DELETE FROM cache")
-            self._conn.commit()
-
-    # ------------------------------------------------------------------
-    # Inspection helpers
-    # ------------------------------------------------------------------
-
+    @property
     def size(self) -> int:
-        """Return the total number of entries in the DB (including expired)."""
-        with self._lock:
-            row = self._conn.execute("SELECT COUNT(*) FROM cache").fetchone()
-            return row[0]
+        with self._conn() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM cache").fetchone()
+            return row[0] if row else 0
 
-    def stats(self) -> CacheStats:
-        """Return in-memory hit/miss/expired counters plus live DB entry count."""
-        with self._lock:
-            return CacheStats(
-                hits=self._hits,
-                misses=self._misses,
-                expired=self._expired,
-                total_entries=self.size(),
-            )
+    def stats(self) -> dict[str, Any]:
+        with self._conn() as conn:
+            row = conn.execute("SELECT COUNT(*), SUM(hit_count) FROM cache").fetchone()
+            count, total_hits = row if row else (0, 0)
+        return {
+            "size": count,
+            "total_hits": int(total_hits or 0),
+            "db_path": self._db_path,
+        }
 
-    def invalidate_expired(self) -> int:
-        """Delete all expired entries. Returns the number of rows removed."""
-        with self._lock:
-            cursor = self._conn.execute(
-                "DELETE FROM cache WHERE expires_at < ?", (time.time(),)
-            )
-            self._conn.commit()
-            return cursor.rowcount
 
-    # ------------------------------------------------------------------
-    # Decorator
-    # ------------------------------------------------------------------
-
-    def cached(self, key_fn: Callable | None = None):  # noqa: B006
-        """Decorator for sync string-returning functions.
-
-        The cached result is stored using the default TTL. Use ``key_fn``
-        to provide a custom cache-key function::
-
-            @cache.cached(key_fn=lambda prompt: hashlib.sha256(prompt.encode()).hexdigest())
-            def call_api(prompt: str) -> str:
-                ...
-
-        Default key: ``sha256("<fn_name>:" + json.dumps(sorted args+kwargs))``.
-        """
-
-        def decorator(fn: Callable) -> Callable:
-            def wrapper(*args, **kwargs):
-                if key_fn is not None:
-                    key = key_fn(*args, **kwargs)
-                else:
-                    payload = json.dumps(
-                        {"args": list(args), "kwargs": sorted(kwargs.items())},
-                        sort_keys=True,
-                        default=str,
-                    )
-                    raw = f"{fn.__name__}:{payload}"
-                    key = hashlib.sha256(raw.encode()).hexdigest()
-
-                cached_value = self.get(key)
-                if cached_value is not None:
-                    return cached_value
-
-                result: str = fn(*args, **kwargs)
-                self.set(key, result)
-                return result
-
-            wrapper.__name__ = fn.__name__
-            wrapper.__doc__ = fn.__doc__
-            return wrapper
-
-        return decorator
-
-    # ------------------------------------------------------------------
-    # Membership test
-    # ------------------------------------------------------------------
-
-    def __contains__(self, key: str) -> bool:
-        """Return True if *key* exists in the cache and has not expired."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT expires_at FROM cache WHERE key = ?", (key,)
-            ).fetchone()
-            if row is None:
-                return False
-            return time.time() <= row[0]
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _evict_if_needed(self) -> None:
-        """Evict oldest entries (by expires_at ASC) until size <= max_entries.
-
-        Must be called while self._lock is already held.
-        """
-        count_row = self._conn.execute("SELECT COUNT(*) FROM cache").fetchone()
-        count = count_row[0]
-        if count <= self._max_entries:
-            return
-
-        excess = count - self._max_entries
-        # Delete the *excess* rows with the smallest expires_at (expire soonest).
-        self._conn.execute(
-            "DELETE FROM cache WHERE key IN ("
-            "  SELECT key FROM cache ORDER BY expires_at ASC LIMIT ?"
-            ")",
-            (excess,),
-        )
-        self._conn.commit()
+__all__ = ["DiskResponseCache", "CacheEntry"]
