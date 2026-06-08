@@ -1,6 +1,6 @@
 """Tests for llm-response-cache-disk."""
+
 import time
-import pytest
 from llm_response_cache_disk import DiskResponseCache, CacheEntry
 
 MSGS = [{"role": "user", "content": "Hello"}]
@@ -125,3 +125,60 @@ def test_stats(tmp_path):
     s = cache.stats()
     assert s["size"] == 1
     assert s["total_hits"] >= 1
+    assert s["db_path"] == db
+
+
+def test_stats_empty(tmp_path):
+    db = str(tmp_path / "cache.db")
+    cache = DiskResponseCache(db)
+    s = cache.stats()
+    assert s["size"] == 0
+    assert s["total_hits"] == 0
+
+
+def test_get_increments_hit_count(tmp_path):
+    db = str(tmp_path / "cache.db")
+    cache = DiskResponseCache(db)
+    cache.put(MSGS, RESPONSE, model="x")
+    cache.get(MSGS, model="x")
+    cache.get(MSGS, model="x")
+    assert cache.stats()["total_hits"] == 2
+
+
+def test_put_overwrites_existing(tmp_path):
+    db = str(tmp_path / "cache.db")
+    cache = DiskResponseCache(db)
+    cache.put(MSGS, {"v": 1}, model="x")
+    cache.put(MSGS, {"v": 2}, model="x")
+    assert cache.size == 1
+    assert cache.get(MSGS, model="x") == {"v": 2}
+
+
+def test_clear_empty(tmp_path):
+    db = str(tmp_path / "cache.db")
+    cache = DiskResponseCache(db)
+    assert cache.clear() == 0
+
+
+def test_extras_differentiate_keys(tmp_path):
+    db = str(tmp_path / "cache.db")
+    cache = DiskResponseCache(db)
+    cache.put(MSGS, {"t": "hot"}, model="x", temperature=0.0)
+    cache.put(MSGS, {"t": "cold"}, model="x", temperature=1.0)
+    assert cache.get(MSGS, model="x", temperature=0.0) == {"t": "hot"}
+    assert cache.get(MSGS, model="x", temperature=1.0) == {"t": "cold"}
+
+
+def test_cache_entry_not_expired_without_ttl():
+    entry = CacheEntry(key="k", response={}, created_at=time.time(), ttl=None)
+    assert entry.expired is False
+
+
+def test_cache_entry_expired():
+    entry = CacheEntry(key="k", response={}, created_at=time.time() - 10, ttl=1.0)
+    assert entry.expired is True
+
+
+def test_cache_entry_within_ttl():
+    entry = CacheEntry(key="k", response={}, created_at=time.time(), ttl=60.0)
+    assert entry.expired is False
